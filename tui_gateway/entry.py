@@ -186,6 +186,10 @@ def _log_exit(reason: str) -> None:
 
 def main():
     _install_sidecar_publisher()
+    
+    # Start background drain thread for completion_queue
+    from tui_gateway.server import _start_background_drain
+    _start_background_drain()
 
     # MCP tool discovery — inline is safe here: TUI entry is a plain
     # sync loop with no asyncio event loop to block.  Previously ran as

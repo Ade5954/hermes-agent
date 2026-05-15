@@ -28,6 +28,101 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
+# Background thread to periodically check completion_queue for idle processing
+_background_drain_thread: Optional[threading.Thread] = None
+_background_drain_running = threading.Event()
+
+
+def _start_background_drain() -> None:
+    """Start a background thread to periodically drain completion_queue when idle."""
+    global _background_drain_thread
+
+    if _background_drain_thread is not None and _background_drain_thread.is_alive():
+        return
+
+    _background_drain_running.set()
+    _background_drain_thread = threading.Thread(
+        target=_background_drain_loop,
+        daemon=True,
+        name="tui-gateway-background-drain",
+    )
+    _background_drain_thread.start()
+
+
+def _stop_background_drain() -> None:
+    """Stop the background drain thread gracefully."""
+    _background_drain_running.clear()
+
+
+def _background_drain_loop() -> None:
+    """Background loop that periodically checks and drains completion_queue."""
+    while _background_drain_running.is_set():
+        try:
+            time.sleep(0.5)  # Check every 500ms
+            _drain_completion_queue_idle()
+        except Exception:
+            # Don't let exceptions kill the thread
+            pass
+
+
+def _drain_completion_queue_idle() -> None:
+    """
+    Drain completion_queue for idle processing (no active session running).
+    Similar to the after-turn drain but checks all sessions and processes
+    notifications when sessions are not busy.
+    """
+    try:
+        from tools.process_registry import process_registry
+        from cli import _format_process_notification
+    except Exception:
+        return
+
+    if process_registry.completion_queue.empty():
+        return
+
+    # Check all sessions to find one that's not running
+    for sid, session in list(_sessions.items()):
+        if not session.get("agent"):
+            continue
+        with session["history_lock"]:
+            if session.get("running"):
+                continue
+            # Check if there are any events to process
+            if process_registry.completion_queue.empty():
+                break
+
+            # We found a non-running session, process the queue
+            try:
+                evt = process_registry.completion_queue.get_nowait()
+                _evt_sid = evt.get("session_id", "")
+                if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+                    continue
+                synth = _format_process_notification(evt)
+                if not synth:
+                    continue
+                # Mark this session as running before starting the agent
+                session["running"] = True
+            except queue.Empty:
+                break
+
+        # Process the notification in a separate thread to avoid blocking the drain loop
+        def process_notification():
+            try:
+                _emit("message.start", sid)
+                _run_prompt_submit(uuid.uuid4().hex[:8], sid, session, synth)
+            except Exception as _n_exc:
+                print(
+                    f"[tui_gateway] background completion notification dispatch failed: "
+                    f"{type(_n_exc).__name__}: {_n_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
+        threading.Thread(target=process_notification, daemon=True).start()
+        break
+
+
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
