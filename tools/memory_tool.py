@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -159,7 +160,7 @@ class MemoryStore:
         if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
             lock_path.write_text(" ", encoding="utf-8")
 
-        fd = open(lock_path, "r+" if msvcrt else "a+", encoding="utf-8")
+        fd = open(lock_path, "r+" if msvcrt else "a+")
         try:
             if fcntl:
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -194,10 +195,88 @@ class MemoryStore:
         fresh = list(dict.fromkeys(fresh))  # deduplicate
         self._set_entries(target, fresh)
 
-    def save_to_disk(self, target: str):
-        """Persist entries to the appropriate file. Called after every mutation."""
+    def save_to_disk(self, target: str, pre_mutation_entries: Optional[List[str]] = None):
+        """Persist entries to the appropriate file. Called after every mutation.
+
+        Uses merge-on-write: before writing, reads the current file and preserves
+        any entries that exist on disk but not in the current memory state
+        (external entries written by patch/shell/concurrent sessions).
+        """
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        path = self._path_for(target)
+        memory_entries = self._entries_for(target)
+
+        self._backup_pre_write(path)
+
+        if path.exists():
+            disk_entries = self._read_file(path)
+            memory_set = set(memory_entries)
+
+            external = []
+            for de in disk_entries:
+                if de not in memory_set:
+                    if pre_mutation_entries and de in pre_mutation_entries:
+                        continue
+                    external.append(de)
+
+            if external:
+                logger.info(
+                    "Preserving %d external entr%s in %s",
+                    len(external), "y" if len(external) == 1 else "ies", path.name,
+                )
+                merged = external + memory_entries
+                self._set_entries(target, merged)
+                self._write_file(path, merged)
+                return
+
+        self._write_file(path, memory_entries)
+
+    @staticmethod
+    def _backup_pre_write(path: Path):
+        """Save a pre-write snapshot before overwriting.
+
+        Creates ``<file>.bak.pre.<timestamp>`` so recovery is possible even
+        after a destructive write.  This is purely defensive — the merge-on-write
+        logic in save_to_disk should prevent data loss in the first place.
+        """
+        if not path.exists():
+            return
+        try:
+            bak_path = path.with_suffix(
+                path.suffix + ".bak.pre." + str(int(time.time()))
+            )
+            bak_path.write_bytes(path.read_bytes())
+        except Exception as exc:
+            logger.warning("Failed to create pre-write backup of %s: %s", path.name, exc)
+
+    def _check_shrinkage(self, target: str, new_entries: List[str]) -> Optional[str]:
+        """Refuse writes that would shrink the file by more than 75%.
+
+        A dramatic size reduction usually means the memory tool's view of the
+        file does not reflect all content on disk (external entries from
+        patch/shell were merged into a single entry that got replaced).
+        Skips files under 2 KB — small files are unlikely to contain important
+        external content that the tool doesn't know about.
+        """
+        path = self._path_for(target)
+        if not path.exists():
+            return None
+        try:
+            current_size = path.stat().st_size
+        except OSError:
+            return None
+        if current_size < 2048:
+            return None
+        new_content = ENTRY_DELIMITER.join(new_entries) if new_entries else ""
+        new_size = len(new_content.encode("utf-8"))
+        if new_size < current_size * 0.25:
+            return (
+                f"This change would shrink {path.name} from {current_size:,} to "
+                f"{new_size:,} bytes ({(1 - new_size/current_size)*100:.0f}% "
+                f"reduction). This likely means external-written entries would "
+                f"be lost. Refusing to proceed."
+            )
+        return None
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -262,7 +341,7 @@ class MemoryStore:
 
             entries.append(content)
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            self.save_to_disk(target, pre_mutation_entries=entries[:-1])
 
         return self._success_response(target, "Entry added.")
 
@@ -284,6 +363,7 @@ class MemoryStore:
             self._reload_target(target)
 
             entries = self._entries_for(target)
+            pre = list(entries)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
@@ -291,7 +371,7 @@ class MemoryStore:
 
             if len(matches) > 1:
                 # If all matches are identical (exact duplicates), operate on the first one
-                unique_texts = {e for _, e in matches}
+                unique_texts = set(e for _, e in matches)
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
                     return {
@@ -307,6 +387,12 @@ class MemoryStore:
             # Check that replacement doesn't blow the budget
             test_entries = entries.copy()
             test_entries[idx] = new_content
+
+            # Check for dramatic shrinkage that suggests data loss
+            shrinkage_err = self._check_shrinkage(target, test_entries)
+            if shrinkage_err:
+                return {"success": False, "error": shrinkage_err}
+
             new_total = len(ENTRY_DELIMITER.join(test_entries))
 
             if new_total > limit:
@@ -320,7 +406,7 @@ class MemoryStore:
 
             entries[idx] = new_content
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            self.save_to_disk(target, pre_mutation_entries=pre)
 
         return self._success_response(target, "Entry replaced.")
 
@@ -334,6 +420,7 @@ class MemoryStore:
             self._reload_target(target)
 
             entries = self._entries_for(target)
+            pre = list(entries)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
@@ -341,7 +428,7 @@ class MemoryStore:
 
             if len(matches) > 1:
                 # If all matches are identical (exact duplicates), remove the first one
-                unique_texts = {e for _, e in matches}
+                unique_texts = set(e for _, e in matches)
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
                     return {
@@ -353,8 +440,14 @@ class MemoryStore:
 
             idx = matches[0][0]
             entries.pop(idx)
+
+            # Check for dramatic shrinkage that suggests data loss
+            shrinkage_err = self._check_shrinkage(target, entries)
+            if shrinkage_err:
+                return {"success": False, "error": shrinkage_err}
+
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            self.save_to_disk(target, pre_mutation_entries=pre)
 
         return self._success_response(target, "Entry removed.")
 
@@ -477,7 +570,7 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in {"memory", "user"}:
+    if target not in ("memory", "user"):
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
     if action == "add":
