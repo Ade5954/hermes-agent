@@ -3514,8 +3514,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     )
                     with session["history_lock"]:
                         session["running"] = False
-        except Exception:
-            pass
+        except Exception as _drain_exc:
+            print(
+                f"[tui_gateway] completion queue drain failed: "
+                f"{type(_drain_exc).__name__}: {_drain_exc}",
+                file=sys.stderr,
+            )
 
     threading.Thread(target=run, daemon=True).start()
 
